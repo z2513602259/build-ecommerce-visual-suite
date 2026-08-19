@@ -8,4 +8,6 @@ For detail pages, Screen 2 still has one independent brief per approved card. De
 
 A/B/C must differ in conversion emphasis and in at least three visual dimensions among worldview, palette, light, layout, scene-mode distribution, target contexts, and proof priorities. Renaming fields or changing only background color is invalid.
 
+The package's `approval_snapshot` must exactly match the receipted frozen approval in `state.json` — same selling points, same order, same approval evidence. `complete_stage.py s3a` refuses any difference and never downgrades the state snapshot with package content.
+
 Run `complete_stage.py s3a <strategy-package.json> <state.json>` to generate `strategy-review.md`, `strategy-A.md`, `strategy-B.md`, `strategy-C.md`, `strategy-handoff.md`, `review-package-manifest.json`, and the S3A state receipt. A/B/C selection is blocked until that command passes. Wait for explicit A/B/C selection.
