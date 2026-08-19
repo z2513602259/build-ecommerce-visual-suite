@@ -1,0 +1,5 @@
+interface:
+  display_name: "电商视觉套图工程"
+  short_description: "跨品牌竞品调研、卖点验收、视觉企划、完整文案与纯图资产生成"
+  default_prompt: "使用 $build-ecommerce-visual-suite 读取当前产品资料，识别任务与视觉模式，先完成竞品调研并提交本品卖点给我验收。"
+
