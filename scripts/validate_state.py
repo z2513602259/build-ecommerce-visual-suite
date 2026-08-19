@@ -105,10 +105,9 @@ def validate(data: Any) -> list[str]:
             if required_value is not None and actual[index] != required_value:
                 errors.append(f"flags are inconsistent with {stage}")
                 break
-    if stage == "S3_STRATEGY_REVIEW" and not isinstance(receipts, dict):
-        errors.append("S3A state requires a verified S3A delivery receipt")
-    if stage == "S3_STRATEGY_REVIEW" and isinstance(receipts, dict) and not isinstance(receipts.get("S3A"), dict):
-        errors.append("S3A state requires delivery_receipts.S3A")
+    # S3_STRATEGY_REVIEW intentionally does not require an S3A receipt: the S2
+    # completion script lands here before S3A delivery. Skipping S3A entirely is
+    # still blocked by complete_stage.py s3b, which demands the receipted package.
     if stage in {"S3_SELECTED_STRATEGY_EXECUTION", "S4_IMAGE_PRODUCTION"} and not isinstance(receipts, dict):
         errors.append("S3B/S4 state requires verified S3A and S3B delivery receipts")
     if stage in {"S3_SELECTED_STRATEGY_EXECUTION", "S4_IMAGE_PRODUCTION"} and isinstance(receipts, dict):

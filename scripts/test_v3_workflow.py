@@ -251,7 +251,95 @@ def production_authorization(root: Path, selected: dict, selected_path: Path, sc
     return {"path": path.name, "sha256": sha(path)}
 
 
+def s1_state() -> dict:
+    return {
+        "schema_version": 3,
+        "skill_version": "3.0.0",
+        "workflow_contract_version": 3,
+        "workflow_id": "WF-TEST",
+        "product_key": "brand/model",
+        "product_fingerprint": "6" * 64,
+        "fingerprints": component_fingerprints(),
+        "product_identity_lock_id": "PIL",
+        "product_identity_lock_status": "READY",
+        "source_inventory": [],
+        "current_stage": "S1_RESEARCH",
+        "task_profile": "DETAIL_PAGE",
+        "visual_mode": "FREE_FISSION_MODE",
+        "task_config": {"target_platform": "JD", "image_count": 17, "screen_count": 12, "screen_count_override": False, "screen2_card_count": 6, "screen2_card_count_override": False, "output_ratios": [], "platform_safe_area": "待调研确认"},
+        "flags": {"COMPETITOR_RESEARCH_COMPLETE": False, "SELLING_POINTS_APPROVED": False, "STRATEGY_APPROVED": False, "EXECUTION_PACKAGE_READY": False},
+        "approval_snapshot": {"selling_points_approved": False, "selling_point_approval_evidence": "", "approved_selling_points": [], "strategy_approved": False, "approved_strategy_id": "", "strategy_approval_evidence": ""},
+        "updated_at": "2026-08-19T10:00:00+08:00",
+    }
+
+
+def selling_point_review_v3(root: Path) -> tuple[dict, Path]:
+    review = legacy.review_artifact()
+    for candidate in review["selling_point_candidates"]:
+        candidate.update(
+            {
+                "消费者决策问题": "这款产品的分区收纳是否匹配我的日常使用？",
+                "利益类型": "功能利益",
+                "具体消费者结果": "日常分类更清楚，取放更高效。",
+                "表达边界": "仅陈述当前产品已确认的事实",
+            }
+        )
+    refs = prepare_refs(root, review)
+    review.update(
+        {
+            "schema_version": 3,
+            "skill_version": "3.0.0",
+            "workflow_contract_version": 3,
+            "product_fingerprint": "6" * 64,
+            "fingerprints": component_fingerprints(),
+            "artifact_refs": refs,
+        }
+    )
+    review.pop("product_identity_lock", None)
+    path = root / "selling-point-review.json"
+    path.write_text(json.dumps(review, ensure_ascii=False, indent=2), encoding="utf-8")
+    return review, path
+
+
+def freeze_approval(approval: dict, review: dict) -> dict:
+    """Freeze approved points as complete copies of the reviewed candidates."""
+    candidates_by_id = {item["卖点ID"]: item for item in review["selling_point_candidates"]}
+    frozen = copy.deepcopy(approval)
+    frozen["approved_selling_points"] = [
+        copy.deepcopy(candidates_by_id[point["卖点ID"]])
+        if isinstance(point, dict) and point.get("卖点ID") in candidates_by_id
+        else point
+        for point in approval.get("approved_selling_points", [])
+    ]
+    return frozen
+
+
+def run_completer(arguments: list[str]) -> int:
+    old = sys.argv
+    try:
+        sys.argv = ["complete_stage.py", *arguments]
+        return stage_completer.main()
+    finally:
+        sys.argv = old
+
+
+def receipted_s2_state(root: Path, data: dict) -> dict:
+    """Build a state that has passed the S1 and S2 scripts end to end."""
+    base = legacy.review_artifact()
+    refs = prepare_refs(root, base)
+    state_path = root / "state.json"
+    state_path.write_text(json.dumps(s1_state(), ensure_ascii=False), encoding="utf-8")
+    assert run_completer(["s1", str(root / refs["research"]["path"]), str(state_path)]) == 0
+    review, review_path = selling_point_review_v3(root)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["approval_snapshot"] = freeze_approval(data["approval_snapshot"], review)
+    state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    assert run_completer(["s2", str(review_path), str(state_path)]) == 0
+    return json.loads(state_path.read_text(encoding="utf-8"))
+
+
 def s2_state(data: dict) -> dict:
+    """Legacy pre-receipt state: S2 approved by hand, no S1/S2 receipts."""
     return {
         "schema_version": 3,
         "skill_version": "3.0.0",
@@ -339,8 +427,12 @@ class V3WorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             strategy, strategy_path = strategy_review_v3(root)
+            state = receipted_s2_state(root, strategy)
+            # Bind the S3A package to the receipted frozen approval snapshot.
+            strategy["approval_snapshot"] = copy.deepcopy(state["approval_snapshot"])
+            strategy_path.write_text(json.dumps(strategy, ensure_ascii=False, indent=2), encoding="utf-8")
             state_path = root / "state.json"
-            state_path.write_text(json.dumps(s2_state(strategy), ensure_ascii=False), encoding="utf-8")
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
             old = sys.argv
             try:
                 sys.argv = ["complete_stage.py", "s3a", str(strategy_path), str(state_path)]
@@ -351,6 +443,9 @@ class V3WorkflowTests(unittest.TestCase):
             self.assertEqual(state["current_stage"], "S3_STRATEGY_REVIEW")
             self.assertIn("S3A", state["delivery_receipts"])
             selected, selected_path = selected_execution_v3(root, strategy, strategy_path)
+            # The user's A/B/C choice updates the state approval before S3B.
+            state["approval_snapshot"] = copy.deepcopy(selected["approval_snapshot"])
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
             old = sys.argv
             try:
                 sys.argv = ["complete_stage.py", "s3b", str(selected_path), str(state_path)]
@@ -365,13 +460,357 @@ class V3WorkflowTests(unittest.TestCase):
             self.assertEqual(state["current_stage"], "S4_IMAGE_PRODUCTION")
             self.assertIn("production_authorization", state)
 
+    def test_s3a_rejects_downgraded_approval_snapshot(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            strategy, strategy_path = strategy_review_v3(root)
+            # The S3A package still carries the legacy five-field snapshot while
+            # the receipted state holds the complete frozen points.
+            state = receipted_s2_state(root, strategy)
+            self.assertGreater(len(state["approval_snapshot"]["approved_selling_points"][0]), 5)
+            state_path = root / "state.json"
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            old = sys.argv
+            try:
+                sys.argv = ["complete_stage.py", "s3a", str(strategy_path), str(state_path)]
+                self.assertEqual(stage_completer.main(), 1)
+            finally:
+                sys.argv = old
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertNotIn("S3A", state.get("delivery_receipts", {}))
+            # The frozen snapshot must not have been downgraded by the rejected run.
+            self.assertGreater(len(state["approval_snapshot"]["approved_selling_points"][0]), 5)
+
+    def test_s3a_cannot_bypass_s2_receipt(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            strategy, strategy_path = strategy_review_v3(root)
+            # Hand-edited legacy state: approval present but no S2 receipt.
+            state_path = root / "state.json"
+            state_path.write_text(json.dumps(s2_state(strategy), ensure_ascii=False), encoding="utf-8")
+            old = sys.argv
+            try:
+                sys.argv = ["complete_stage.py", "s3a", str(strategy_path), str(state_path)]
+                self.assertEqual(stage_completer.main(), 1)
+            finally:
+                sys.argv = old
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertNotIn("S3A", state.get("delivery_receipts", {}))
+
+    def test_s1_receipt_opens_s2_and_s2_requires_explicit_approval(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            base = legacy.review_artifact()
+            refs = prepare_refs(root, base)
+            research_path = root / refs["research"]["path"]
+            state_path = root / "state.json"
+            state_path.write_text(json.dumps(s1_state(), ensure_ascii=False), encoding="utf-8")
+            old = sys.argv
+            try:
+                sys.argv = ["complete_stage.py", "s1", str(research_path), str(state_path)]
+                self.assertEqual(stage_completer.main(), 0)
+            finally:
+                sys.argv = old
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["current_stage"], "S2_PRODUCT_SELLING_POINT_REVIEW")
+            self.assertTrue(state["flags"]["COMPETITOR_RESEARCH_COMPLETE"])
+            self.assertIn("S1", state["delivery_receipts"])
+            self.assertEqual(state_validator.validate(state), [])
+
+            review, review_path = selling_point_review_v3(root)
+            old = sys.argv
+            try:
+                # Approval is still pending in state; S2 must refuse.
+                sys.argv = ["complete_stage.py", "s2", str(review_path), str(state_path)]
+                self.assertEqual(stage_completer.main(), 1)
+            finally:
+                sys.argv = old
+            state["approval_snapshot"] = freeze_approval(legacy.approval(6), review)
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            old = sys.argv
+            try:
+                sys.argv = ["complete_stage.py", "s2", str(review_path), str(state_path)]
+                self.assertEqual(stage_completer.main(), 0)
+            finally:
+                sys.argv = old
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["current_stage"], "S3_STRATEGY_REVIEW")
+            self.assertTrue(state["flags"]["SELLING_POINTS_APPROVED"])
+            self.assertIn("S2", state["delivery_receipts"])
+            self.assertEqual(state_validator.validate(state), [])
+
+    def test_s2_rejects_approval_of_unreviewed_selling_points(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            base = legacy.review_artifact()
+            refs = prepare_refs(root, base)
+            research_path = root / refs["research"]["path"]
+            state_path = root / "state.json"
+            state_path.write_text(json.dumps(s1_state(), ensure_ascii=False), encoding="utf-8")
+            old = sys.argv
+            try:
+                sys.argv = ["complete_stage.py", "s1", str(research_path), str(state_path)]
+                self.assertEqual(stage_completer.main(), 0)
+            finally:
+                sys.argv = old
+            review, review_path = selling_point_review_v3(root)
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            approved = freeze_approval(legacy.approval(6), review)
+            rogue = copy.deepcopy(approved["approved_selling_points"][0])
+            rogue["卖点ID"] = "CSP-999"
+            approved["approved_selling_points"].append(rogue)
+            state["approval_snapshot"] = approved
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            old = sys.argv
+            try:
+                sys.argv = ["complete_stage.py", "s2", str(review_path), str(state_path)]
+                self.assertEqual(stage_completer.main(), 1)
+            finally:
+                sys.argv = old
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["current_stage"], "S2_PRODUCT_SELLING_POINT_REVIEW")
+            self.assertNotIn("S2", state["delivery_receipts"])
+
+    def test_s2_rejects_tampered_approved_content(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            base = legacy.review_artifact()
+            refs = prepare_refs(root, base)
+            research_path = root / refs["research"]["path"]
+            state_path = root / "state.json"
+            state_path.write_text(json.dumps(s1_state(), ensure_ascii=False), encoding="utf-8")
+            assert run_completer(["s1", str(research_path), str(state_path)]) == 0
+            review, review_path = selling_point_review_v3(root)
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            approved = freeze_approval(legacy.approval(6), review)
+            # ID stays in the candidate set; the reviewed fact is silently rewritten.
+            approved["approved_selling_points"][0]["具体产品事实"] = "被篡改的事实"
+            state["approval_snapshot"] = approved
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            old = sys.argv
+            try:
+                sys.argv = ["complete_stage.py", "s2", str(review_path), str(state_path)]
+                self.assertEqual(stage_completer.main(), 1)
+            finally:
+                sys.argv = old
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertNotIn("S2", state.get("delivery_receipts", {}))
+
+    def test_s2_rejects_deleted_approved_field(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            base = legacy.review_artifact()
+            refs = prepare_refs(root, base)
+            research_path = root / refs["research"]["path"]
+            state_path = root / "state.json"
+            state_path.write_text(json.dumps(s1_state(), ensure_ascii=False), encoding="utf-8")
+            assert run_completer(["s1", str(research_path), str(state_path)]) == 0
+            review, review_path = selling_point_review_v3(root)
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            approved = freeze_approval(legacy.approval(6), review)
+            # Deleting a frozen field must fail the same way rewriting it does.
+            del approved["approved_selling_points"][0]["具体产品事实"]
+            state["approval_snapshot"] = approved
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            old = sys.argv
+            try:
+                sys.argv = ["complete_stage.py", "s2", str(review_path), str(state_path)]
+                self.assertEqual(stage_completer.main(), 1)
+            finally:
+                sys.argv = old
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertNotIn("S2", state.get("delivery_receipts", {}))
+
+    def test_s2_rejects_deleted_extended_fields(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            base = legacy.review_artifact()
+            refs = prepare_refs(root, base)
+            research_path = root / refs["research"]["path"]
+            state_path = root / "state.json"
+            state_path.write_text(json.dumps(s1_state(), ensure_ascii=False), encoding="utf-8")
+            assert run_completer(["s1", str(research_path), str(state_path)]) == 0
+            review, review_path = selling_point_review_v3(root)
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            approved = freeze_approval(legacy.approval(6), review)
+            # Deleting all four v3 extended fields must fail the same way as a partial set.
+            for key in ("消费者决策问题", "利益类型", "具体消费者结果", "表达边界"):
+                del approved["approved_selling_points"][0][key]
+            state["approval_snapshot"] = approved
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            old = sys.argv
+            try:
+                sys.argv = ["complete_stage.py", "s2", str(review_path), str(state_path)]
+                self.assertEqual(stage_completer.main(), 1)
+            finally:
+                sys.argv = old
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertNotIn("S2", state.get("delivery_receipts", {}))
+
+    def test_s2_rejects_deleted_research_metadata_field(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            base = legacy.review_artifact()
+            refs = prepare_refs(root, base)
+            research_path = root / refs["research"]["path"]
+            state_path = root / "state.json"
+            state_path.write_text(json.dumps(s1_state(), ensure_ascii=False), encoding="utf-8")
+            assert run_completer(["s1", str(research_path), str(state_path)]) == 0
+            review, review_path = selling_point_review_v3(root)
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            approved = freeze_approval(legacy.approval(6), review)
+            # Every candidate field is frozen; deleting research metadata is the same violation.
+            del approved["approved_selling_points"][0]["风险或待确认项"]
+            state["approval_snapshot"] = approved
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            old = sys.argv
+            try:
+                sys.argv = ["complete_stage.py", "s2", str(review_path), str(state_path)]
+                self.assertEqual(stage_completer.main(), 1)
+            finally:
+                sys.argv = old
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertNotIn("S2", state.get("delivery_receipts", {}))
+
+    def test_s2_rejects_duplicate_approved_selling_point_ids(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            base = legacy.review_artifact()
+            refs = prepare_refs(root, base)
+            research_path = root / refs["research"]["path"]
+            state_path = root / "state.json"
+            state_path.write_text(json.dumps(s1_state(), ensure_ascii=False), encoding="utf-8")
+            assert run_completer(["s1", str(research_path), str(state_path)]) == 0
+            review, review_path = selling_point_review_v3(root)
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            approved = freeze_approval(legacy.approval(6), review)
+            # Duplicating a complete frozen point must be rejected at the S2 gate,
+            # not deferred to a downstream duplicate check.
+            approved["approved_selling_points"].append(copy.deepcopy(approved["approved_selling_points"][0]))
+            state["approval_snapshot"] = approved
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            old = sys.argv
+            try:
+                sys.argv = ["complete_stage.py", "s2", str(review_path), str(state_path)]
+                self.assertEqual(stage_completer.main(), 1)
+            finally:
+                sys.argv = old
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertNotIn("S2", state.get("delivery_receipts", {}))
+
+    def test_s2_rejects_non_object_approval_entries(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            base = legacy.review_artifact()
+            refs = prepare_refs(root, base)
+            research_path = root / refs["research"]["path"]
+            state_path = root / "state.json"
+            state_path.write_text(json.dumps(s1_state(), ensure_ascii=False), encoding="utf-8")
+            assert run_completer(["s1", str(research_path), str(state_path)]) == 0
+            review, review_path = selling_point_review_v3(root)
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            approved = freeze_approval(legacy.approval(6), review)
+            # Non-object entries must be rejected explicitly, never silently skipped.
+            approved["approved_selling_points"].append("not a selling-point object")
+            state["approval_snapshot"] = approved
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            old = sys.argv
+            try:
+                sys.argv = ["complete_stage.py", "s2", str(review_path), str(state_path)]
+                self.assertEqual(stage_completer.main(), 1)
+            finally:
+                sys.argv = old
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertNotIn("S2", state.get("delivery_receipts", {}))
+
+    def test_backfill_recovers_legacy_pre_receipt_state(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            base = legacy.review_artifact()
+            refs = prepare_refs(root, base)
+            research_path = root / refs["research"]["path"]
+            review, review_path = selling_point_review_v3(root)
+            state_path = root / "state.json"
+            # Legacy hand-approved state: at S2 with approval but no receipts.
+            legacy_state = s2_state(review)
+            legacy_state["approval_snapshot"] = freeze_approval(legacy.approval(6), review)
+            state_path.write_text(json.dumps(legacy_state, ensure_ascii=False), encoding="utf-8")
+            old = sys.argv
+            try:
+                # s2 first: it advances the legacy S2 state into a valid stage.
+                sys.argv = ["complete_stage.py", "s2", str(review_path), str(state_path), "--backfill"]
+                self.assertEqual(stage_completer.main(), 0)
+                sys.argv = ["complete_stage.py", "s1", str(research_path), str(state_path), "--backfill"]
+                self.assertEqual(stage_completer.main(), 0)
+            finally:
+                sys.argv = old
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertIn("S1", state["delivery_receipts"])
+            self.assertIn("S2", state["delivery_receipts"])
+            # The s2 backfill advances the legacy S2 state into a valid stage.
+            self.assertEqual(state["current_stage"], "S3_STRATEGY_REVIEW")
+            self.assertEqual(state_validator.validate(state), [])
+
+    def test_s3a_requires_s1_receipt_after_backfill(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            base = legacy.review_artifact()
+            refs = prepare_refs(root, base)
+            review, review_path = selling_point_review_v3(root)
+            strategy, strategy_path = strategy_review_v3(root)
+            state_path = root / "state.json"
+            legacy_state = s2_state(strategy)
+            legacy_state["approval_snapshot"] = freeze_approval(legacy.approval(6), review)
+            state_path.write_text(json.dumps(legacy_state, ensure_ascii=False), encoding="utf-8")
+            # Only s2 --backfill runs; the documented s1 --backfill is skipped.
+            old = sys.argv
+            try:
+                sys.argv = ["complete_stage.py", "s2", str(review_path), str(state_path), "--backfill"]
+                self.assertEqual(stage_completer.main(), 0)
+            finally:
+                sys.argv = old
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertIn("S2", state["delivery_receipts"])
+            self.assertNotIn("S1", state["delivery_receipts"])
+            # S3A must refuse until the S1 receipt also exists.
+            strategy["approval_snapshot"] = copy.deepcopy(state["approval_snapshot"])
+            strategy_path.write_text(json.dumps(strategy, ensure_ascii=False, indent=2), encoding="utf-8")
+            old = sys.argv
+            try:
+                sys.argv = ["complete_stage.py", "s3a", str(strategy_path), str(state_path)]
+                self.assertEqual(stage_completer.main(), 1)
+            finally:
+                sys.argv = old
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertNotIn("S3A", state.get("delivery_receipts", {}))
+
+    def test_s1_cannot_complete_from_later_stage(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            base = legacy.review_artifact()
+            refs = prepare_refs(root, base)
+            research_path = root / refs["research"]["path"]
+            state_path = root / "state.json"
+            later = s1_state()
+            later["current_stage"] = "S3_STRATEGY_REVIEW"
+            later["flags"]["COMPETITOR_RESEARCH_COMPLETE"] = True
+            later["flags"]["SELLING_POINTS_APPROVED"] = True
+            state_path.write_text(json.dumps(later, ensure_ascii=False), encoding="utf-8")
+            old = sys.argv
+            try:
+                sys.argv = ["complete_stage.py", "s1", str(research_path), str(state_path)]
+                self.assertEqual(stage_completer.main(), 1)
+            finally:
+                sys.argv = old
+
     def test_s3b_cannot_bypass_s3a_receipt(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             strategy, strategy_path = strategy_review_v3(root)
             selected, selected_path = selected_execution_v3(root, strategy, strategy_path)
+            state = receipted_s2_state(root, strategy)
             state_path = root / "state.json"
-            state_path.write_text(json.dumps(s2_state(strategy), ensure_ascii=False), encoding="utf-8")
+            state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
             old = sys.argv
             try:
                 sys.argv = ["complete_stage.py", "s3b", str(selected_path), str(state_path)]

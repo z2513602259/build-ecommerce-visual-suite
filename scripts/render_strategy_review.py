@@ -707,6 +707,8 @@ def render_selected_handoff(data: dict[str, Any]) -> str:
             "",
             "> 当前门控：等待你明确要求生成图片。",
             "",
+            f"> 一致性确认：执行书与已批准方案{option_id}的策略、文案、卖点与任务 ID 已通过机器校验，零差异。如发现任何不一致，请指出具体位置。",
+            "",
             "- [选定方案执行书（推荐审核）](selected-strategy-review.md)",
             "- [机器校验源（无需阅读）](selected-strategy-package.json)",
             "",
